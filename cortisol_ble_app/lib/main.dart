@@ -156,6 +156,7 @@ class _BleHomeState extends State<BleHome> {
   String? _measureLiveIssue;
   _MeasureSummary? _lastMeasureSummary;
   int _calibrationInvalidSamples = 0;
+  int? _lastProcessedTs;
   static const Duration _measureDuration = Duration(seconds: 60);
   static const int _measureMinValidSamples = 8;
 
@@ -474,6 +475,7 @@ class _BleHomeState extends State<BleHome> {
       _measureValidSamples = 0;
       _measureInvalidSamples = 0;
       _measureLiveIssue = null;
+      _lastProcessedTs = null;
     });
     _stressMeasureTicker?.cancel();
     _stressMeasureTicker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -1210,6 +1212,11 @@ class _BleHomeState extends State<BleHome> {
     if (tsRaw is num) ts = tsRaw.toInt();
     if (tsRaw is String) ts = int.tryParse(tsRaw);
 
+    // Same BLE packet can arrive from both notify streams; dedupe by timestamp.
+    if (ts != null && ts == _lastProcessedTs) {
+      return;
+    }
+
     MetricGroup? bpm;
     MetricGroup? gsr;
     MetricGroup? tempGroup;
@@ -1299,6 +1306,9 @@ class _BleHomeState extends State<BleHome> {
 
     bool finalizeMeasure = false;
     setState(() {
+      if (ts != null) {
+        _lastProcessedTs = ts;
+      }
       _ts = ts ?? _ts;
       _bpm = bpm ?? _bpm;
       _gsr = gsr ?? _gsr;

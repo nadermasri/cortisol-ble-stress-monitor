@@ -11,11 +11,22 @@ struct Stats {
   ESP32: BLE + OLED + MAX30102 + MAX30205 + GSR
 
   Behavior
-  1) Sample BPM, Temp, GSR every 1 second
-  2) Collect 10 samples
-  3) Compute avg, min, max, std dev for each over the 10 samples
-  4) Send stats over BLE as a compact JSON string:
-     {"t":123,"b":{...},"g":{...},"tc":{... or null}}
+  1) Device stays in deep sleep by default
+  2) Wake on external button press
+  3) BLE advertises and waits up to 60 seconds for phone connection
+  4) If connected, start a 5-minute active session
+  5) Sample BPM, Temp, GSR every 1 second
+  6) Collect 10 samples, compute avg/min/max/std, and send every 10 seconds
+  7) If button is pressed during active session, extend by +5 minutes
+  8) On disconnect / timeout / session end, return to deep sleep
+
+  Fixes included
+  - Proper deep-sleep wake on GPIO33
+  - MAX30102 processing limited per loop so BLE is not starved
+  - Reduced serial logging rate
+  - Lower MAX30102 LED current
+  - Lower no-finger threshold
+  - BLE notify debug prints
 *************************************************************/
 
 #include <math.h>
@@ -37,7 +48,36 @@ struct Stats {
 
 #include <esp_gap_ble_api.h>
 #include <esp_gatt_defs.h>
+#include <esp_sleep.h>
 #include <esp_system.h>
+#include <driver/rtc_io.h>
+
+// -------------------- Forward declarations --------------------
+void prepareWakeButton();
+void enterDeepSleep(const char* reason);
+bool consumeButtonPressEvent();
+
+void oledPrintStatus(const String& a, const String& b = "", const String& c = "");
+void oledShowPairingPinLarge(uint32_t pin, bool connected);
+void updateOLEDStats(float bpmAvg, float tempAvg, float gsrAvg);
+void oledShowStressResult(const char* level, float score, float confidence);
+
+int readGsrAverage();
+void setupBLE();
+void checkBleHeartbeatTimeout();
+void ensureBleAdvertisingAlive();
+void logBleStatusIfNeeded();
+
+Stats computeStats(const float* x, int n);
+Stats computeStatsTempIgnoreNaN(const float* x, int n);
+void bleSendStatsJSON(uint32_t tsMs, const Stats& b, const Stats& t, const Stats& g);
+void sampleEvery1s();
+void processBleEvents();
+void refreshPairingScreenIfNeeded();
+void refreshResultScreenIfNeeded();
+
+uint8_t findMAX30205Addr();
+void forceBleDisconnect(const char* reason);
 
 // -------------------- I2C pins --------------------
 #define SDA_PIN 21
@@ -46,16 +86,24 @@ struct Stats {
 // -------------------- GSR --------------------
 #define GSR_PIN 34
 
+// -------------------- Wake / session button --------------------
+#define WAKE_BUTTON_PIN 33   // button to GND
+
 // -------------------- MAX30102 --------------------
 MAX30105 particleSensor;
 bool max30102_ok = false;
 
 const byte RATE_SIZE = 4;
-byte rates[RATE_SIZE];
+byte rates[RATE_SIZE] = {0, 0, 0, 0};
 byte rateSpot = 0;
 long lastBeat = 0;
 float beatsPerMinute = 0;
 int beatAvg = 0;
+
+static const long IR_NO_FINGER_THRESHOLD = 5000;
+static const uint8_t MAX30102_LED_RED = 0x10;
+static const uint8_t MAX30102_LED_IR  = 0x10;
+static const int MAX_SAMPLES_PER_LOOP = 4;
 
 // -------------------- MAX30205 --------------------
 ClosedCube_MAX30205 max30205;
@@ -93,14 +141,11 @@ BLECharacteristic* pHeartbeatChar = nullptr;
 volatile bool bleClientConnected = false;
 volatile uint32_t lastHeartbeatMs = 0;
 volatile bool evtHeartbeatTimeout = false;
-static const uint32_t HEARTBEAT_TIMEOUT_MS = 30000; // drop stale links after 30s
+static const uint32_t HEARTBEAT_TIMEOUT_MS = 30000;
 volatile uint32_t lastAdvKickMs = 0;
 static const uint32_t ADV_WATCHDOG_MS = 5000;
 volatile uint32_t lastStatusLogMs = 0;
 static const uint32_t STATUS_LOG_MS = 5000;
-volatile bool pendingBleSoftReboot = false;
-volatile uint32_t bleSoftRebootAtMs = 0;
-static const uint32_t BLE_SOFT_REBOOT_DELAY_MS = 1500;
 volatile bool evtResultReady = false;
 char pendingResultLevel[16] = "N/A";
 volatile float pendingResultScore = 0.0f;
@@ -110,14 +155,31 @@ uint32_t resultScreenUntilMs = 0;
 char resultLevel[16] = "N/A";
 float resultScore = 0.0f;
 float resultConfidence = 0.0f;
-static const uint32_t RESULT_SHOW_MS = 15000; // show stress result on OLED for 15s
+static const uint32_t RESULT_SHOW_MS = 15000;
 static const uint32_t SAMPLE_INTERVAL_MS = 1000;
 uint32_t lastSampleMs = 0;
 
-// Dynamic passkey (changes on each passkey request)
+// -------------------- Session state machine --------------------
+enum DeviceState {
+  STATE_CONNECT,
+  STATE_ACTIVE_SESSION
+};
+
+DeviceState deviceState = STATE_CONNECT;
+uint32_t connectDeadlineMs = 0;
+uint32_t sessionDeadlineMs = 0;
+
+static const uint32_t CONNECT_TIMEOUT_MS    = 60000;
+static const uint32_t SESSION_WINDOW_MS     = 300000;
+static const uint32_t SESSION_EXTENSION_MS  = 300000;
+static const bool START_ACTIVE_ON_COLD_BOOT = false;
+
+volatile bool evtButtonPressed = false;
+
+// Dynamic passkey
 static uint32_t BLE_PASSKEY = 0;
 
-// ---- Deferred BLE events (safe UI handling in loop) ----
+// ---- Deferred BLE events ----
 volatile bool evtBleConnected = false;
 volatile bool evtBleDisconnected = false;
 volatile bool evtAuthSuccess = false;
@@ -129,7 +191,59 @@ volatile uint32_t evtPasskey = 0;
 volatile bool pairingPinActive = false;
 volatile uint32_t pairingPinValue = 0;
 volatile uint32_t pairingPinUntilMs = 0;
-static const uint32_t PIN_SHOW_MS = 120000; // 2 minutes
+static const uint32_t PIN_SHOW_MS = 120000;
+
+// -------------------- Sampling buffers --------------------
+static const int WIN = 10;  // sample every 1s, send aggregated stats every 10 samples
+
+float bpmBuf[WIN];
+float tempBuf[WIN];
+float gsrBuf[WIN];
+int sampleCount = 0;
+
+// -------------------- Interrupt --------------------
+void IRAM_ATTR onSessionButtonPress() {
+  evtButtonPressed = true;
+}
+
+bool consumeButtonPressEvent() {
+  static uint32_t lastAcceptedMs = 0;
+  if (!evtButtonPressed) return false;
+
+  evtButtonPressed = false;
+
+  uint32_t now = millis();
+  if ((uint32_t)(now - lastAcceptedMs) < 250) return false;
+
+  lastAcceptedMs = now;
+  return true;
+}
+
+void prepareWakeButton() {
+  pinMode(WAKE_BUTTON_PIN, INPUT_PULLUP);
+  detachInterrupt(digitalPinToInterrupt(WAKE_BUTTON_PIN));
+  attachInterrupt(digitalPinToInterrupt(WAKE_BUTTON_PIN), onSessionButtonPress, FALLING);
+}
+
+void enterDeepSleep(const char* reason) {
+  Serial.print("Entering deep sleep: ");
+  Serial.println(reason);
+
+  if (oled_ok) oledPrintStatus("SLEEP", reason, "Press button to wake");
+
+  delay(120);
+  BLEDevice::deinit(false);
+
+  rtc_gpio_deinit((gpio_num_t)WAKE_BUTTON_PIN);
+  rtc_gpio_init((gpio_num_t)WAKE_BUTTON_PIN);
+  rtc_gpio_set_direction((gpio_num_t)WAKE_BUTTON_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pullup_en((gpio_num_t)WAKE_BUTTON_PIN);
+  rtc_gpio_pulldown_dis((gpio_num_t)WAKE_BUTTON_PIN);
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_BUTTON_PIN, 0);
+  delay(50);
+  esp_deep_sleep_start();
+}
 
 static uint32_t genPasskey6() {
   return 100000u + (esp_random() % 900000u);
@@ -144,8 +258,9 @@ uint8_t findMAX30205Addr() {
 }
 
 // -------------------- OLED helpers --------------------
-void oledPrintStatus(const String& a, const String& b = "", const String& c = "") {
+void oledPrintStatus(const String& a, const String& b, const String& c) {
   if (!oled_ok) return;
+
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
@@ -180,8 +295,8 @@ void oledShowPairingPinLarge(uint32_t pin, bool connected) {
 
 void updateOLEDStats(float bpmAvg, float tempAvg, float gsrAvg) {
   if (!oled_ok) return;
-  if (pairingPinActive) return; // don't overwrite pairing PIN screen
-  if (resultScreenActive) return; // don't overwrite stress result screen
+  if (pairingPinActive) return;
+  if (resultScreenActive) return;
 
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
@@ -210,6 +325,7 @@ void updateOLEDStats(float bpmAvg, float tempAvg, float gsrAvg) {
 
 void oledShowStressResult(const char* level, float score, float confidence) {
   if (!oled_ok) return;
+
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
@@ -236,11 +352,11 @@ void oledShowStressResult(const char* level, float score, float confidence) {
 // -------------------- GSR average --------------------
 int readGsrAverage() {
   long sum = 0;
-  for (int i = 0; i < 10; i++) {
+  for (int i = 0; i < 5; i++) {
     sum += analogRead(GSR_PIN);
-    delay(5);
+    delay(1);
   }
-  return (int)(sum / 10);
+  return (int)(sum / 5);
 }
 
 // -------------------- BLE callbacks --------------------
@@ -288,14 +404,13 @@ class MyServerCallbacks : public BLEServerCallbacks {
     (void)server;
     bleClientConnected = false;
     evtBleDisconnected = true;
-    pendingBleSoftReboot = true;
-    bleSoftRebootAtMs = millis() + BLE_SOFT_REBOOT_DELAY_MS;
     BLEDevice::startAdvertising();
   }
 };
 
 void forceBleDisconnect(const char* reason) {
   if (!pServer) return;
+
   uint16_t connId = pServer->getConnId();
   Serial.print("Forcing BLE disconnect: ");
   Serial.println(reason);
@@ -305,12 +420,15 @@ void forceBleDisconnect(const char* reason) {
 class HeartbeatCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* characteristic) override {
     if (!characteristic) return;
+
     String value = characteristic->getValue();
     lastHeartbeatMs = millis();
+
     if (value.startsWith("RESULT|")) {
       int p1 = value.indexOf('|');
       int p2 = value.indexOf('|', p1 + 1);
       int p3 = value.indexOf('|', p2 + 1);
+
       if (p1 >= 0 && p2 > p1 && p3 > p2) {
         String lvl = value.substring(p1 + 1, p2);
         String scoreStr = value.substring(p2 + 1, p3);
@@ -325,7 +443,10 @@ class HeartbeatCallbacks : public BLECharacteristicCallbacks {
       }
       return;
     }
-    Serial.println("BLE heartbeat received");
+
+    Serial.print("BLE heartbeat received: ");
+    Serial.println(value);
+
     if (value == "RESET") {
       forceBleDisconnect("remote reset request");
     }
@@ -343,7 +464,6 @@ void setupBLE() {
   security->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
   security->setKeySize(16);
 
-  // Dynamic passkey via callbacks
   BLEDevice::setSecurityCallbacks(new MySecurityCallbacks());
 
   pServer = BLEDevice::createServer();
@@ -366,6 +486,7 @@ void setupBLE() {
     BLECharacteristic::PROPERTY_WRITE |
     BLECharacteristic::PROPERTY_WRITE_NR
   );
+
   pHeartbeatChar->setAccessPermissions(ESP_GATT_PERM_WRITE_ENC_MITM);
   pHeartbeatChar->setCallbacks(new HeartbeatCallbacks());
 
@@ -382,8 +503,10 @@ void setupBLE() {
 
 void checkBleHeartbeatTimeout() {
   if (!bleClientConnected) return;
+
   uint32_t now = millis();
   if ((uint32_t)(now - lastHeartbeatMs) <= HEARTBEAT_TIMEOUT_MS) return;
+
   evtHeartbeatTimeout = true;
   Serial.println("BLE heartbeat timeout");
   forceBleDisconnect("heartbeat timeout");
@@ -392,8 +515,10 @@ void checkBleHeartbeatTimeout() {
 
 void ensureBleAdvertisingAlive() {
   if (bleClientConnected) return;
+
   uint32_t now = millis();
   if ((uint32_t)(now - lastAdvKickMs) < ADV_WATCHDOG_MS) return;
+
   lastAdvKickMs = now;
   BLEDevice::stopAdvertising();
   delay(20);
@@ -404,6 +529,7 @@ void ensureBleAdvertisingAlive() {
 void logBleStatusIfNeeded() {
   uint32_t now = millis();
   if ((uint32_t)(now - lastStatusLogMs) < STATUS_LOG_MS) return;
+
   lastStatusLogMs = now;
   Serial.print("BLE status connected=");
   Serial.print(bleClientConnected ? "1" : "0");
@@ -413,21 +539,16 @@ void logBleStatusIfNeeded() {
   Serial.println((unsigned long)(now - lastAdvKickMs));
 }
 
-void rebootIfBleRequested() {
-  if (!pendingBleSoftReboot) return;
-  if ((int32_t)(millis() - bleSoftRebootAtMs) < 0) return;
-  pendingBleSoftReboot = false;
-  Serial.println("BLE soft reboot now");
-  delay(80);
-  ESP.restart();
-}
-
 // -------------------- Stats helpers --------------------
 Stats computeStats(const float* x, int n) {
   Stats s;
   s.valid = (n > 0);
+
   if (!s.valid) {
-    s.avg = NAN; s.mn = NAN; s.mx = NAN; s.sd = NAN;
+    s.avg = NAN;
+    s.mn = NAN;
+    s.mx = NAN;
+    s.sd = NAN;
     return s;
   }
 
@@ -460,29 +581,27 @@ Stats computeStats(const float* x, int n) {
 }
 
 Stats computeStatsTempIgnoreNaN(const float* x, int n) {
-  float tmp[10];
+  float tmp[WIN];
   int m = 0;
+
   for (int i = 0; i < n; i++) {
     if (!isnan(x[i])) tmp[m++] = x[i];
   }
+
   if (m == 0) {
     Stats s;
     s.valid = false;
-    s.avg = NAN; s.mn = NAN; s.mx = NAN; s.sd = NAN;
+    s.avg = NAN;
+    s.mn = NAN;
+    s.mx = NAN;
+    s.sd = NAN;
     return s;
   }
+
   return computeStats(tmp, m);
 }
 
-// -------------------- Sampling buffers --------------------
-static const int WIN = 10;
-
-float bpmBuf[WIN];
-float tempBuf[WIN];
-float gsrBuf[WIN];
-int sampleCount = 0;
-
-// -------------------- BLE send stats as compact JSON --------------------
+// -------------------- BLE send stats --------------------
 void bleSendStatsJSON(uint32_t tsMs, const Stats& b, const Stats& t, const Stats& g) {
   if (!pChar) return;
 
@@ -520,13 +639,18 @@ void bleSendStatsJSON(uint32_t tsMs, const Stats& b, const Stats& t, const Stats
 
   if (n <= 0 || n >= (int)sizeof(buf)) return;
 
-  Serial.println(buf); // debug: verify payload
+  Serial.println("Sending BLE JSON:");
+  Serial.println(buf);
+
   pChar->setValue((uint8_t*)buf, (size_t)n);
-  if (bleClientConnected) pChar->notify();
+
+  if (bleClientConnected) {
+    pChar->notify();
+    Serial.println("notify() called");
+  }
 }
 
-
-// -------------------- every 1s: sample and every 10 samples: compute + send --------------------
+// -------------------- Sampling --------------------
 void sampleEvery1s() {
   float tempC = NAN;
   if (max30205_ok) tempC = max30205.readTemperature() + TEMP_OFFSET_C;
@@ -650,6 +774,19 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
+  prepareWakeButton();
+
+  esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
+  Serial.print("Wakeup cause: ");
+  Serial.println((int)wakeupCause);
+
+  bool wokeFromButton = (wakeupCause == ESP_SLEEP_WAKEUP_EXT0);
+
+  if (!wokeFromButton && !START_ACTIVE_ON_COLD_BOOT) {
+    delay(80);
+    enterDeepSleep("Wait wake button");
+  }
+
   Serial.println("Init OLED...");
   oled_ok = display.begin(SSD1306_SWITCHCAPVCC);
   if (oled_ok) oledPrintStatus("OLED OK", "Booting...");
@@ -672,9 +809,9 @@ void setup() {
     Serial.println("MAX30102 FAILED. Continuing without BPM.");
     if (oled_ok) oledPrintStatus("MAX30102 FAIL", "BPM will be 0");
   } else {
-    particleSensor.setup(0x3F, 4, 2, 100, 411, 4096); // bright, stable
-    particleSensor.setPulseAmplitudeRed(0x3F);         // visible LED
-    particleSensor.setPulseAmplitudeIR(0x3F);          // IR channel
+    particleSensor.setup(0x1F, 4, 2, 100, 411, 4096);
+    particleSensor.setPulseAmplitudeRed(MAX30102_LED_RED);
+    particleSensor.setPulseAmplitudeIR(MAX30102_LED_IR);
     particleSensor.setPulseAmplitudeGreen(0x00);
     Serial.println("MAX30102 OK.");
     if (oled_ok) oledPrintStatus("MAX30102 OK", "Red LED should be ON");
@@ -698,52 +835,108 @@ void setup() {
   }
 
   lastSampleMs = millis();
+  connectDeadlineMs = millis() + CONNECT_TIMEOUT_MS;
+  sessionDeadlineMs = 0;
+  deviceState = STATE_CONNECT;
 
   if (oled_ok) {
-    oledPrintStatus("RUNNING",
-                    "BLE: ADV (pair phone)",
-                    "Cloud: OFF");
+    oledPrintStatus("WAIT CONNECT", "BLE advertising", "Connect in 60s");
   }
 }
 
 void loop() {
+  uint32_t now = millis();
+
+  bool buttonPressed = consumeButtonPressEvent();
+
+  if (buttonPressed && deviceState == STATE_ACTIVE_SESSION) {
+    sessionDeadlineMs += SESSION_EXTENSION_MS;
+    Serial.println("Session extension requested (+5 min)");
+    if (oled_ok) oledPrintStatus("SESSION EXTENDED", "+5 minutes", "Continue sampling");
+  }
+
   processBleEvents();
   refreshPairingScreenIfNeeded();
   refreshResultScreenIfNeeded();
 
-  if (millis() - lastSampleMs >= SAMPLE_INTERVAL_MS) {
-    lastSampleMs += SAMPLE_INTERVAL_MS;
-    sampleEvery1s();
+  if (deviceState == STATE_CONNECT) {
+    if (bleClientConnected) {
+      deviceState = STATE_ACTIVE_SESSION;
+      sessionDeadlineMs = now + SESSION_WINDOW_MS;
+      sampleCount = 0;
+      lastSampleMs = now;
+      Serial.println("Connected -> Active session started (5 min)");
+      if (oled_ok) oledPrintStatus("SESSION ACTIVE", "Sampling + send", "Window: 5 min");
+    } else if ((int32_t)(now - connectDeadlineMs) >= 0) {
+      enterDeepSleep("Connect timeout");
+    }
+  } else if (deviceState == STATE_ACTIVE_SESSION) {
+    if (!bleClientConnected) {
+      enterDeepSleep("BLE disconnected");
+    }
+
+    if ((uint32_t)(now - lastSampleMs) >= SAMPLE_INTERVAL_MS) {
+      lastSampleMs += SAMPLE_INTERVAL_MS;
+      sampleEvery1s();
+    }
+
+    if ((int32_t)(now - sessionDeadlineMs) >= 0) {
+      enterDeepSleep("Session complete");
+    }
   }
+
   checkBleHeartbeatTimeout();
   ensureBleAdvertisingAlive();
   logBleStatusIfNeeded();
-  rebootIfBleRequested();
 
-  // MAX30102 BPM update loop
   if (max30102_ok) {
     particleSensor.check();
 
-    if (particleSensor.available()) {
+    int processed = 0;
+    while (particleSensor.available() && processed < MAX_SAMPLES_PER_LOOP) {
       long irValue = particleSensor.getIR();
       particleSensor.nextSample();
+      processed++;
 
       if (checkForBeat(irValue)) {
         long delta = millis() - lastBeat;
         lastBeat = millis();
-        beatsPerMinute = 60.0f / (delta / 1000.0f);
 
-        if (beatsPerMinute < 255 && beatsPerMinute > 20) {
-          rates[rateSpot++] = (byte)beatsPerMinute;
-          rateSpot %= RATE_SIZE;
+        if (delta > 0) {
+          beatsPerMinute = 60.0f / (delta / 1000.0f);
 
-          beatAvg = 0;
-          for (byte i = 0; i < RATE_SIZE; i++) beatAvg += rates[i];
-          beatAvg /= RATE_SIZE;
+          if (beatsPerMinute > 20 && beatsPerMinute < 255) {
+            rates[rateSpot++] = (byte)beatsPerMinute;
+            rateSpot %= RATE_SIZE;
+
+            int sumRates = 0;
+            int validRates = 0;
+            for (byte i = 0; i < RATE_SIZE; i++) {
+              if (rates[i] > 0) {
+                sumRates += rates[i];
+                validRates++;
+              }
+            }
+
+            if (validRates > 0) {
+              beatAvg = sumRates / validRates;
+            }
+          }
         }
       }
 
-    if (irValue < 18000) beatAvg = 0;
+      if (irValue < IR_NO_FINGER_THRESHOLD) {
+        beatAvg = 0;
+      }
+
+      static uint32_t lastBpmLogMs = 0;
+      if (millis() - lastBpmLogMs >= 500) {
+        lastBpmLogMs = millis();
+        Serial.print("IR=");
+        Serial.print(irValue);
+        Serial.print(" BPM=");
+        Serial.println(beatAvg);
+      }
     }
   } else {
     beatAvg = 0;
