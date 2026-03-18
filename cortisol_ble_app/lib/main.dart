@@ -151,14 +151,19 @@ class _BleHomeState extends State<BleHome> {
   Timer? _stressMeasureTicker;
   final List<double> _measureScores = [];
   final List<double> _measureConfidences = [];
+  final List<double> _measureBpmValues = [];
+  final List<double> _measureGsrValues = [];
+  final List<double> _measureTempValues = [];
   int _measureValidSamples = 0;
   int _measureInvalidSamples = 0;
   String? _measureLiveIssue;
   _MeasureSummary? _lastMeasureSummary;
+  final List<_MeasurementRecord> _measurementHistory = [];
   int _calibrationInvalidSamples = 0;
   int? _lastProcessedTs;
-  static const Duration _measureDuration = Duration(seconds: 60);
-  static const int _measureMinValidSamples = 8;
+  static const Duration _measureBaseDuration = Duration(seconds: 60);
+  static const Duration _measureMaxDuration = Duration(minutes: 2);
+  static const int _measureMinValidSamples = 6;
 
   @override
   void initState() {
@@ -438,15 +443,33 @@ class _BleHomeState extends State<BleHome> {
     return DateTime.now().difference(started);
   }
 
+  Duration get _stressMeasureTargetDuration {
+    if (!_stressMeasureActive) return _measureBaseDuration;
+    if (_stressMeasureElapsed < _measureBaseDuration) return _measureBaseDuration;
+    final enough = _measureValidSamples >= _measureMinValidSamples && _measureScores.isNotEmpty;
+    if (enough) return _measureBaseDuration;
+    return _measureMaxDuration;
+  }
+
   Duration get _stressMeasureRemaining {
-    final left = _measureDuration - _stressMeasureElapsed;
+    final left = _stressMeasureTargetDuration - _stressMeasureElapsed;
     return left.isNegative ? Duration.zero : left;
   }
 
   double get _stressMeasureProgress {
-    if (_measureDuration.inMilliseconds == 0) return 0;
-    return (_stressMeasureElapsed.inMilliseconds / _measureDuration.inMilliseconds).clamp(0.0, 1.0);
+    final targetMs = _stressMeasureTargetDuration.inMilliseconds;
+    if (targetMs == 0) return 0;
+    return (_stressMeasureElapsed.inMilliseconds / targetMs).clamp(0.0, 1.0);
   }
+
+  bool get _shouldFinalizeStressMeasure {
+    final enough = _measureValidSamples >= _measureMinValidSamples && _measureScores.isNotEmpty;
+    if (_stressMeasureElapsed < _measureBaseDuration) return false;
+    if (enough) return true;
+    return _stressMeasureElapsed >= _measureMaxDuration;
+  }
+
+  bool get _inferenceReady => _stressEngine.currentWindowSamples >= _stressEngine.minSamplesForInference;
 
   String? _plausibilityIssue({double? bpmAvg, double? gsrAvg, double? tempAvg}) {
     if (!_isValidSignal(bpmAvg)) return "Heart rate not detected";
@@ -466,12 +489,19 @@ class _BleHomeState extends State<BleHome> {
       unawaited(_showToast("Connect device before measuring stress"));
       return;
     }
+    if (!_inferenceReady) {
+      unawaited(_showToast("Preparing inference window. Please wait."));
+      return;
+    }
     if (_stressMeasureActive) return;
     setState(() {
       _stressMeasureActive = true;
       _stressMeasureStartedAt = DateTime.now();
       _measureScores.clear();
       _measureConfidences.clear();
+      _measureBpmValues.clear();
+      _measureGsrValues.clear();
+      _measureTempValues.clear();
       _measureValidSamples = 0;
       _measureInvalidSamples = 0;
       _measureLiveIssue = null;
@@ -480,7 +510,7 @@ class _BleHomeState extends State<BleHome> {
     _stressMeasureTicker?.cancel();
     _stressMeasureTicker = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted || !_stressMeasureActive) return;
-      if (_stressMeasureRemaining == Duration.zero) {
+      if (_shouldFinalizeStressMeasure) {
         _finalizeStressMeasurement();
         return;
       }
@@ -506,6 +536,18 @@ class _BleHomeState extends State<BleHome> {
 
     final enough = _measureValidSamples >= _measureMinValidSamples && _measureScores.isNotEmpty;
     _MeasureSummary? summary;
+    double? avgBpm;
+    double? avgGsr;
+    double? avgTemp;
+    if (_measureBpmValues.isNotEmpty) {
+      avgBpm = _measureBpmValues.reduce((a, b) => a + b) / _measureBpmValues.length;
+    }
+    if (_measureGsrValues.isNotEmpty) {
+      avgGsr = _measureGsrValues.reduce((a, b) => a + b) / _measureGsrValues.length;
+    }
+    if (_measureTempValues.isNotEmpty) {
+      avgTemp = _measureTempValues.reduce((a, b) => a + b) / _measureTempValues.length;
+    }
     if (enough) {
       final meanScore = _measureScores.reduce((a, b) => a + b) / _measureScores.length;
       final meanConfidence = _measureConfidences.isEmpty
@@ -518,6 +560,9 @@ class _BleHomeState extends State<BleHome> {
         level: level,
         validSamples: _measureValidSamples,
         invalidSamples: _measureInvalidSamples,
+        avgBpm: avgBpm,
+        avgGsr: avgGsr,
+        avgTemp: avgTemp,
       );
     }
 
@@ -537,18 +582,30 @@ class _BleHomeState extends State<BleHome> {
     }
 
     if (!mounted) return;
-    setState(() {
-      _stressMeasureActive = false;
-      _stressMeasureStartedAt = null;
-      _lastMeasureSummary = summary;
-      if (summary == null) {
+      setState(() {
+        _stressMeasureActive = false;
+        _stressMeasureStartedAt = null;
+        _lastMeasureSummary = summary;
+        if (summary == null) {
         _measureLiveIssue = "Not enough valid samples. Re-measure with better sensor contact.";
       } else {
         _measureLiveIssue = null;
-        _history.add(measuredEntry!);
-        if (_history.length > 300) _history.removeAt(0);
-      }
-    });
+          _history.add(measuredEntry!);
+          if (_history.length > 300) _history.removeAt(0);
+          _measurementHistory.add(
+            _MeasurementRecord(
+              when: DateTime.now(),
+              level: summary.level,
+              score: summary.score,
+              confidence: summary.confidence,
+              avgBpm: summary.avgBpm,
+              avgGsr: summary.avgGsr,
+              avgTemp: summary.avgTemp,
+            ),
+          );
+          if (_measurementHistory.length > 50) _measurementHistory.removeAt(0);
+        }
+      });
     if (measuredEntry != null) {
       unawaited(_appendHistoryLog(measuredEntry));
     }
@@ -565,10 +622,12 @@ class _BleHomeState extends State<BleHome> {
             : Text(
                 "Final stress level: ${summary.level}\n"
                 "Stress score: ${summary.score.toStringAsFixed(3)}\n"
-                "Confidence: ${(summary.confidence * 100).toStringAsFixed(0)}%\n"
                 "Cortisol proxy: ${(summary.score * 100).toStringAsFixed(1)}\n"
                 "Valid samples: ${summary.validSamples}\n"
-                "Invalid samples: ${summary.invalidSamples}",
+                "Invalid samples: ${summary.invalidSamples}\n"
+                "Avg BPM: ${summary.avgBpm?.toStringAsFixed(1) ?? "N/A"}\n"
+                "Avg GSR: ${summary.avgGsr?.toStringAsFixed(1) ?? "N/A"}\n"
+                "Avg Temp: ${summary.avgTemp?.toStringAsFixed(1) ?? "N/A"}",
               ),
         actions: [
           TextButton(
@@ -951,7 +1010,7 @@ class _BleHomeState extends State<BleHome> {
     await _connectTo(target, resetData: false, silentReconnect: true);
   }
 
-  Future<void> _connectTo(ScanResult r, {bool resetData = true, bool silentReconnect = false}) async {
+  Future<void> _connectTo(ScanResult r, {bool resetData = false, bool silentReconnect = false}) async {
     if (_connecting) return;
 
     await _stopScan();
@@ -1216,7 +1275,6 @@ class _BleHomeState extends State<BleHome> {
     if (ts != null && ts == _lastProcessedTs) {
       return;
     }
-
     MetricGroup? bpm;
     MetricGroup? gsr;
     MetricGroup? tempGroup;
@@ -1262,9 +1320,12 @@ class _BleHomeState extends State<BleHome> {
       return;
     }
 
-    final bpmNow = bpm ?? _bpm;
-    final gsrNow = gsr ?? _gsr;
-    final tempAvgNow = temp ?? _temp;
+    final hasFreshBpm = bpm?.avg != null;
+    final hasFreshGsr = gsr?.avg != null;
+    final hasFreshTemp = temp != null;
+    final bpmNow = hasFreshBpm ? bpm : _bpm;
+    final gsrNow = hasFreshGsr ? gsr : _gsr;
+    final tempAvgNow = hasFreshTemp ? temp : _temp;
     final tsVal = ts ?? _ts;
     final bpmValid = _isValidSignal(bpmNow?.avg);
     final gsrValid = _isValidSignal(gsrNow?.avg);
@@ -1286,7 +1347,7 @@ class _BleHomeState extends State<BleHome> {
     }
 
     StressInferenceResult? inference;
-    if (stressIssue == null) {
+    if (bpmNow?.avg != null && gsrNow?.avg != null) {
       inference = _stressEngine.addSample(
         ts: tsVal,
         bpmAvg: bpmNow?.avg,
@@ -1336,6 +1397,9 @@ class _BleHomeState extends State<BleHome> {
       }
 
       if (_stressMeasureActive) {
+        if (bpmValid) _measureBpmValues.add(bpmNow!.avg!);
+        if (gsrValid) _measureGsrValues.add(gsrNow!.avg!);
+        if (tempValid) _measureTempValues.add(tempAvgNow!);
         if (inference != null && stressIssue == null) {
           _measureScores.add(inference.stressProbability);
           _measureConfidences.add(inference.confidence);
@@ -1343,9 +1407,14 @@ class _BleHomeState extends State<BleHome> {
           _measureLiveIssue = null;
         } else {
           _measureInvalidSamples += 1;
-          _measureLiveIssue = stressIssue ?? "Waiting for enough window samples";
+          if (stressIssue != null) {
+            _measureLiveIssue = stressIssue;
+          } else {
+            _measureLiveIssue =
+                "Preparing inference window (${_stressEngine.currentWindowSamples}/${_stressEngine.minSamplesForInference})";
+          }
         }
-        if (_stressMeasureRemaining == Duration.zero) {
+        if (_shouldFinalizeStressMeasure) {
           finalizeMeasure = true;
         }
       }
@@ -1485,7 +1554,7 @@ class _BleHomeState extends State<BleHome> {
                         name: name,
                         id: id,
                         rssi: r.rssi,
-                        onTap: () => _connectTo(r),
+                        onTap: () => _connectTo(r, resetData: false),
                       );
                     }).toList(),
                   ),
@@ -1499,6 +1568,10 @@ class _BleHomeState extends State<BleHome> {
   Widget _buildDashboardTab() {
     final calibTimeProgress = (_guidedCalibrationElapsed.inMilliseconds / _minCalibrationDuration.inMilliseconds)
         .clamp(0.0, 1.0);
+    final canStartMeasure = _connected && !_stressMeasureActive && _inferenceReady;
+    final warmupTarget = _stressEngine.minSamplesForInference;
+    final warmupCurrent = _stressEngine.currentWindowSamples;
+    final warmupProgress = warmupTarget <= 0 ? 1.0 : (warmupCurrent / warmupTarget).clamp(0.0, 1.0);
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -1544,6 +1617,24 @@ class _BleHomeState extends State<BleHome> {
                       ? "Measuring now. Keep good sensor contact and stay still."
                       : "Press Measure stress to run a timed measurement and get a final output.",
                 ),
+                if (!_stressMeasureActive && !_inferenceReady) ...[
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: CircularProgressIndicator(value: warmupProgress, strokeWidth: 3),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          "Preparing inference window ($warmupCurrent/$warmupTarget)",
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
                 const SizedBox(height: 10),
                 if (_stressMeasureActive) ...[
                   Row(
@@ -1582,6 +1673,9 @@ class _BleHomeState extends State<BleHome> {
                       _MiniPill(text: "Last ${_lastMeasureSummary!.level}"),
                       _MiniPill(text: "Score ${_lastMeasureSummary!.score.toStringAsFixed(3)}"),
                       _MiniPill(text: "Conf ${(100 * _lastMeasureSummary!.confidence).toStringAsFixed(0)}%"),
+                      _MiniPill(text: "Avg BPM ${_lastMeasureSummary!.avgBpm?.toStringAsFixed(1) ?? "N/A"}"),
+                      _MiniPill(text: "Avg GSR ${_lastMeasureSummary!.avgGsr?.toStringAsFixed(1) ?? "N/A"}"),
+                      _MiniPill(text: "Avg Temp ${_lastMeasureSummary!.avgTemp?.toStringAsFixed(1) ?? "N/A"}"),
                     ],
                   ),
                 ],
@@ -1591,7 +1685,7 @@ class _BleHomeState extends State<BleHome> {
                   runSpacing: 10,
                   children: [
                     FilledButton.icon(
-                      onPressed: (_stressMeasureActive || !_connected) ? null : _startStressMeasurement,
+                      onPressed: canStartMeasure ? _startStressMeasurement : null,
                       icon: const Icon(Icons.play_arrow),
                       label: const Text("Measure stress"),
                     ),
@@ -1605,6 +1699,12 @@ class _BleHomeState extends State<BleHome> {
               ],
             ),
           ),
+        ),
+        const SizedBox(height: 12),
+        _CardSection(
+          title: "Previous measurements",
+          subtitle: "Recent session outputs with average physiological values",
+          child: _MeasurementTable(entries: _measurementHistory),
         ),
         const SizedBox(height: 12),
         if (_guidedCalibrationActive)
@@ -2319,14 +2419,19 @@ class _MetricsGrid extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final showLastAverages = !stressMeasureActive && measuredSummary != null;
     final stressText = stressMeasureActive ? "Measuring..." : (measuredSummary?.level ?? "Not measured");
-    final confidenceCombined = measuredSummary == null
+    final confidenceLevel = measuredSummary == null
         ? "N/A"
-        : "${(measuredSummary!.confidence * 100).toStringAsFixed(0)}% "
-            "(${measuredSummary!.confidence >= 0.75 ? "High" : (measuredSummary!.confidence >= 0.45 ? "Medium" : "Low")})";
-    final bpmAvgDisplay = _fmt(bpm?.avg);
-    final gsrAvgDisplay = _fmt(gsr?.avg);
-    final tempAvgDisplay = _fmt(temp);
+        : (measuredSummary!.confidence >= 0.75
+            ? "High"
+            : (measuredSummary!.confidence >= 0.45 ? "Medium" : "Low"));
+    final bpmAvgDisplay = _fmt(showLastAverages ? measuredSummary!.avgBpm : bpm?.avg);
+    final gsrAvgDisplay = _fmt(showLastAverages ? measuredSummary!.avgGsr : gsr?.avg);
+    final tempAvgDisplay = _fmt(showLastAverages ? measuredSummary!.avgTemp : temp);
+    final avgLabelPrefix = stressMeasureActive
+        ? "Live avg"
+        : (showLastAverages ? "Last avg" : "Live avg");
 
     return Card(
       child: Padding(
@@ -2334,9 +2439,16 @@ class _MetricsGrid extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text("Live averages", style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            Text(
+              showLastAverages ? "Last measurement averages" : "Live averages",
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
             const SizedBox(height: 4),
-            const Text("Simple view for BPM, GSR, and temperature"),
+            Text(
+              showLastAverages
+                  ? "Last completed measurement averages for BPM, GSR, and temperature"
+                  : "Simple view for BPM, GSR, and temperature",
+            ),
             const SizedBox(height: 10),
             Wrap(
               spacing: 10,
@@ -2347,7 +2459,7 @@ class _MetricsGrid extends StatelessWidget {
                   icon: Icons.favorite,
                   accent: const Color(0xFFE11D48),
                   primaryValue: bpmAvgDisplay,
-                  primaryUnit: "Average BPM",
+                  primaryUnit: "$avgLabelPrefix BPM",
                   details: const [],
                 ),
                 _ExpandableMetricCard(
@@ -2355,7 +2467,7 @@ class _MetricsGrid extends StatelessWidget {
                   icon: Icons.waves,
                   accent: const Color(0xFF14B8A6),
                   primaryValue: gsrAvgDisplay,
-                  primaryUnit: "Average GSR",
+                  primaryUnit: "$avgLabelPrefix GSR",
                   details: const [],
                 ),
                 _ExpandableMetricCard(
@@ -2363,7 +2475,7 @@ class _MetricsGrid extends StatelessWidget {
                   icon: Icons.thermostat,
                   accent: const Color(0xFFF59E0B),
                   primaryValue: tempAvgDisplay,
-                  primaryUnit: "Average °C",
+                  primaryUnit: "$avgLabelPrefix °C",
                   details: const [],
                 ),
                 _ExpandableMetricCard(
@@ -2373,7 +2485,7 @@ class _MetricsGrid extends StatelessWidget {
                   primaryValue: stressText,
                   primaryUnit: "level",
                   details: [
-                    ("Confidence", confidenceCombined),
+                    ("Confidence", confidenceLevel),
                   ],
                   footer: Align(
                     alignment: Alignment.centerRight,
@@ -2686,7 +2798,6 @@ class _StressDetailsPage extends StatelessWidget {
     final activeScore = measuredSummary?.score ?? stressResult?.stressProbability;
     final activeConfidence = measuredSummary?.confidence ?? stressResult?.confidence;
     final activeLevel = measuredSummary?.level ?? stressResult?.levelText;
-    final confidence = activeConfidence == null ? "N/A" : "${(activeConfidence * 100).toStringAsFixed(0)}%";
     final confidenceLevel = activeConfidence == null
         ? "N/A"
         : (activeConfidence >= 0.75
@@ -2710,7 +2821,6 @@ class _StressDetailsPage extends StatelessWidget {
               children: [
                 _MiniPill(text: "Stress level $stressLevel"),
                 _MiniPill(text: "Stress score $stressScore"),
-                _MiniPill(text: "Confidence $confidence"),
                 _MiniPill(text: "Confidence level $confidenceLevel"),
                 _MiniPill(text: "Cortisol proxy $cortisolProxy"),
               ],
@@ -2727,12 +2837,6 @@ class _StressDetailsPage extends StatelessWidget {
                   value: stressScore,
                   explanation:
                       "Stress score is the model output after calibration adjustment and smoothing. Smoothing uses exponential update: smooth_t = 0.7 * smooth_(t-1) + 0.3 * raw_t.",
-                ),
-                _ExplainTile(
-                  title: "Confidence",
-                  value: confidence,
-                  explanation:
-                      "Confidence blends baseline-relative sensor deviation confidence and model certainty. Sensor side uses HR, EDA, and Temp z-band levels weighted 0.4, 0.4, 0.2.",
                 ),
                 _ExplainTile(
                   title: "Confidence level",
@@ -2831,6 +2935,9 @@ class _MeasureSummary {
   final String level;
   final int validSamples;
   final int invalidSamples;
+  final double? avgBpm;
+  final double? avgGsr;
+  final double? avgTemp;
 
   const _MeasureSummary({
     required this.score,
@@ -2838,7 +2945,80 @@ class _MeasureSummary {
     required this.level,
     required this.validSamples,
     required this.invalidSamples,
+    this.avgBpm,
+    this.avgGsr,
+    this.avgTemp,
   });
+}
+
+class _MeasurementRecord {
+  final DateTime when;
+  final String level;
+  final double score;
+  final double confidence;
+  final double? avgBpm;
+  final double? avgGsr;
+  final double? avgTemp;
+
+  const _MeasurementRecord({
+    required this.when,
+    required this.level,
+    required this.score,
+    required this.confidence,
+    required this.avgBpm,
+    required this.avgGsr,
+    required this.avgTemp,
+  });
+}
+
+class _MeasurementTable extends StatelessWidget {
+  final List<_MeasurementRecord> entries;
+
+  const _MeasurementTable({required this.entries});
+
+  @override
+  Widget build(BuildContext context) {
+    if (entries.isEmpty) {
+      return const _EmptyState(text: "No completed measurements yet.");
+    }
+
+    final rows = entries.reversed.take(12).toList(growable: false);
+    String fmt(double? v) => v == null ? "N/A" : v.toStringAsFixed(1);
+
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: DataTable(
+        columns: const [
+          DataColumn(label: Text("Time")),
+          DataColumn(label: Text("Level")),
+          DataColumn(label: Text("Score")),
+          DataColumn(label: Text("Conf %")),
+          DataColumn(label: Text("Avg BPM")),
+          DataColumn(label: Text("Avg GSR")),
+          DataColumn(label: Text("Avg Temp")),
+        ],
+        rows: rows
+            .map(
+              (e) => DataRow(
+                cells: [
+                  DataCell(
+                    Text(
+                      "${e.when.hour.toString().padLeft(2, '0')}:${e.when.minute.toString().padLeft(2, '0')}:${e.when.second.toString().padLeft(2, '0')}",
+                    ),
+                  ),
+                  DataCell(Text(e.level)),
+                  DataCell(Text(e.score.toStringAsFixed(3))),
+                  DataCell(Text((e.confidence * 100).toStringAsFixed(0))),
+                  DataCell(Text(fmt(e.avgBpm))),
+                  DataCell(Text(fmt(e.avgGsr))),
+                  DataCell(Text(fmt(e.avgTemp))),
+                ],
+              ),
+            )
+            .toList(growable: false),
+      ),
+    );
+  }
 }
 
 class _CardSection extends StatelessWidget {

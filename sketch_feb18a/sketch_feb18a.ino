@@ -20,13 +20,6 @@ struct Stats {
   7) If button is pressed during active session, extend by +5 minutes
   8) On disconnect / timeout / session end, return to deep sleep
 
-  Fixes included
-  - Proper deep-sleep wake on GPIO33
-  - MAX30102 processing limited per loop so BLE is not starved
-  - Reduced serial logging rate
-  - Lower MAX30102 LED current
-  - Lower no-finger threshold
-  - BLE notify debug prints
 *************************************************************/
 
 #include <math.h>
@@ -79,7 +72,7 @@ void refreshResultScreenIfNeeded();
 uint8_t findMAX30205Addr();
 void forceBleDisconnect(const char* reason);
 
-// -------------------- I2C pins --------------------
+// I2C pins
 #define SDA_PIN 21
 #define SCL_PIN 22
 
@@ -99,10 +92,19 @@ byte rateSpot = 0;
 long lastBeat = 0;
 float beatsPerMinute = 0;
 int beatAvg = 0;
+float bpmSmoothed = 0.0f;
+bool pulseLocked = false;
+uint32_t lastMaxSampleSeenMs = 0;
+uint32_t lastValidBeatMs = 0;
 
 static const long IR_NO_FINGER_THRESHOLD = 5000;
-static const uint8_t MAX30102_LED_RED = 0x10;
-static const uint8_t MAX30102_LED_IR  = 0x10;
+static const uint32_t NO_FINGER_HOLD_MS = 1200;
+static const uint32_t NO_SAMPLE_HOLD_MS = 3000;
+static const uint32_t NO_BEAT_HOLD_MS = 8000;
+uint32_t lowIrSinceMs = 0;
+
+static const uint8_t MAX30102_LED_RED = 0x1F;
+static const uint8_t MAX30102_LED_IR  = 0x1F;
 static const int MAX_SAMPLES_PER_LOOP = 4;
 
 // -------------------- MAX30205 --------------------
@@ -304,7 +306,14 @@ void updateOLEDStats(float bpmAvg, float tempAvg, float gsrAvg) {
   display.setTextSize(2);
   display.setCursor(0, 0);
   display.print("B:");
-  display.print((int)(bpmAvg + 0.5f));
+  if (!pulseLocked || bpmAvg <= 0.1f) {
+    display.setTextSize(1);
+    display.setCursor(18, 6);
+    display.print("Acq");
+    display.setTextSize(2);
+  } else {
+    display.print((int)(bpmAvg + 0.5f));
+  }
 
   display.setTextSize(1);
   display.setCursor(0, 28);
@@ -655,7 +664,7 @@ void sampleEvery1s() {
   float tempC = NAN;
   if (max30205_ok) tempC = max30205.readTemperature() + TEMP_OFFSET_C;
 
-  float bpmNow = (float)beatAvg;
+  float bpmNow = (bpmSmoothed > 0.1f) ? bpmSmoothed : (float)beatAvg;
   float gsrNow = (float)readGsrAverage();
 
   bpmBuf[sampleCount]  = bpmNow;
@@ -897,6 +906,7 @@ void loop() {
       long irValue = particleSensor.getIR();
       particleSensor.nextSample();
       processed++;
+      lastMaxSampleSeenMs = millis();
 
       if (checkForBeat(irValue)) {
         long delta = millis() - lastBeat;
@@ -920,13 +930,24 @@ void loop() {
 
             if (validRates > 0) {
               beatAvg = sumRates / validRates;
+              if (beatAvg > 20) pulseLocked = true;
+              lastValidBeatMs = millis();
+              if (bpmSmoothed <= 0.1f) bpmSmoothed = beatAvg;
+              else bpmSmoothed = 0.75f * bpmSmoothed + 0.25f * beatAvg;
             }
           }
         }
       }
 
       if (irValue < IR_NO_FINGER_THRESHOLD) {
-        beatAvg = 0;
+        if (lowIrSinceMs == 0) lowIrSinceMs = millis();
+        if (millis() - lowIrSinceMs >= NO_FINGER_HOLD_MS) {
+          beatAvg = 0;
+          bpmSmoothed = 0.0f;
+          pulseLocked = false;
+        }
+      } else {
+        lowIrSinceMs = 0;
       }
 
       static uint32_t lastBpmLogMs = 0;
@@ -934,12 +955,30 @@ void loop() {
         lastBpmLogMs = millis();
         Serial.print("IR=");
         Serial.print(irValue);
-        Serial.print(" BPM=");
-        Serial.println(beatAvg);
+        Serial.print(" BPMraw=");
+        Serial.print(beatAvg);
+        Serial.print(" BPMsm=");
+        Serial.println((int)(bpmSmoothed + 0.5f));
       }
+    }
+
+    // If sensor stops producing samples, do not keep stale BPM.
+    if (lastMaxSampleSeenMs > 0 && (uint32_t)(millis() - lastMaxSampleSeenMs) > NO_SAMPLE_HOLD_MS) {
+      beatAvg = 0;
+      bpmSmoothed = 0.0f;
+      pulseLocked = false;
+    }
+
+    // If no beat has been detected for a while, clear stale BPM.
+    if (lastValidBeatMs > 0 && (uint32_t)(millis() - lastValidBeatMs) > NO_BEAT_HOLD_MS) {
+      beatAvg = 0;
+      bpmSmoothed = 0.0f;
+      pulseLocked = false;
     }
   } else {
     beatAvg = 0;
+    bpmSmoothed = 0.0f;
+    pulseLocked = false;
   }
 
   delay(5);

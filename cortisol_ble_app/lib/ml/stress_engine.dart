@@ -31,6 +31,7 @@ class StressInferenceResult {
 }
 
 class StressEngine {
+  static const int _minInferenceSamples = 4;
   final int windowSize;
   final int stepSize;
   final int baselineWindows;
@@ -125,6 +126,7 @@ class StressEngine {
   int get baselineTarget => baselineWindows;
   int get currentWindowSamples => _points.length;
   int get windowTarget => windowSize;
+  int get minSamplesForInference => _minInferenceSamples;
 
   void loadFlutterModel(Map<String, dynamic> json) {
     final type = (json['type'] ?? '').toString();
@@ -179,7 +181,7 @@ class StressEngine {
     }
 
     _samplesSinceInference++;
-    if (_points.length < 12 || _samplesSinceInference < stepSize) {
+    if (_points.length < _minInferenceSamples || _samplesSinceInference < stepSize) {
       return null;
     }
     _samplesSinceInference = 0;
