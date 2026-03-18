@@ -68,6 +68,7 @@ void sampleEvery1s();
 void processBleEvents();
 void refreshPairingScreenIfNeeded();
 void refreshResultScreenIfNeeded();
+float normalizeTempReadingC(float rawTempC);
 
 uint8_t findMAX30205Addr();
 void forceBleDisconnect(const char* reason);
@@ -112,7 +113,7 @@ ClosedCube_MAX30205 max30205;
 bool max30205_ok = false;
 uint8_t max30205Addr = 0;
 
-float TEMP_OFFSET_C = 0.0f;
+float TEMP_OFFSET_C = 12.0f;
 
 // -------------------- OLED (SPI) --------------------
 #define SCREEN_WIDTH 128
@@ -257,6 +258,13 @@ uint8_t findMAX30205Addr() {
     if (Wire.endTransmission() == 0) return a;
   }
   return 0;
+}
+
+float normalizeTempReadingC(float rawTempC) {
+  float t = rawTempC;
+  if (t > 80.0f) t /= 10.0f;
+  if (t > 80.0f) t /= 10.0f;
+  return t;
 }
 
 // -------------------- OLED helpers --------------------
@@ -662,7 +670,9 @@ void bleSendStatsJSON(uint32_t tsMs, const Stats& b, const Stats& t, const Stats
 // -------------------- Sampling --------------------
 void sampleEvery1s() {
   float tempC = NAN;
-  if (max30205_ok) tempC = max30205.readTemperature() + TEMP_OFFSET_C;
+  if (max30205_ok) {
+    tempC = normalizeTempReadingC(max30205.readTemperature()) + TEMP_OFFSET_C;
+  }
 
   float bpmNow = (bpmSmoothed > 0.1f) ? bpmSmoothed : (float)beatAvg;
   float gsrNow = (float)readGsrAverage();
